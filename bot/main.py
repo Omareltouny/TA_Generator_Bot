@@ -5,7 +5,15 @@ import asyncio
 import logging
 
 from telegram import BotCommand, Update
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+from telegram.request import HTTPXRequest
 
 from bot.config import Config
 from bot.db.session import make_engine, make_session_factory
@@ -17,11 +25,20 @@ from bot.services.llm_router import build_router
 
 log = logging.getLogger("bot")
 
-COMMANDS = [("start", "Register / main menu"), ("newcourse", "New course from an outline PDF"), ("courses", "Pick a course"),
-            ("plan", "View/edit the term plan"), ("generate", "Generate labs/tutorials/assignments"),
-            ("items", "Browse items, approve, feedback"), ("rules", "Course feedback rules"),
-            ("history", "Item version history"), ("logo", "Upload logo"), ("template", "Output template"),
-            ("cancel", "Cancel running job"), ("help", "Help")]
+COMMANDS = [
+    ("start", "Register / main menu"),
+    ("newcourse", "New course from an outline PDF"),
+    ("courses", "Pick a course"),
+    ("plan", "View/edit the term plan"),
+    ("generate", "Generate labs/tutorials/assignments"),
+    ("items", "Browse items, approve, feedback"),
+    ("rules", "Course feedback rules"),
+    ("history", "Item version history"),
+    ("logo", "Upload logo"),
+    ("template", "Output template"),
+    ("cancel", "Cancel running job"),
+    ("help", "Help"),
+]
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -60,6 +77,7 @@ async def _outline_correction(update, ctx, user, text):
     from bot.db.models import Course
     from bot.services import outline_parser as op
     from bot.services.llm_router import AllProvidersBusy
+
     async with ui.sf(ctx)() as s:
         st = await repo.get_state(s, user.id)
         course = await s.get(Course, st.course_id)
@@ -73,7 +91,15 @@ async def _outline_correction(update, ctx, user, text):
         c = await s.get(Course, course.id)
         await repo.apply_outline(c, new.model_dump())
         await s.commit()
-    await ui.reply(update, op.summarize(new), ui.kb([("Continue to plan", "oc")], [("Add slides", "up:slides"), ("Add past labs/tutorials", "up:reference")], [("Add logo", "up:logo")]))
+    await ui.reply(
+        update,
+        op.summarize(new),
+        ui.kb(
+            [("Continue to plan", "oc")],
+            [("Add slides", "up:slides"), ("Add past labs/tutorials", "up:reference")],
+            [("Add logo", "up:logo")],
+        ),
+    )
 
 
 async def cmd_help(update, ctx):
@@ -93,8 +119,13 @@ async def cb_menu(update, ctx, user):
     elif action == "rules":
         await feedback.show_rules(update, ctx, user)
     elif action == "up":
-        await update.effective_message.reply_text("What do you want to add?", reply_markup=ui.kb(
-            [("Lecture slides", "up:slides"), ("Past labs/tutorials", "up:reference")], [("Logo", "up:logo"), ("Template (.docx)", "up:template")]))
+        await update.effective_message.reply_text(
+            "What do you want to add?",
+            reply_markup=ui.kb(
+                [("Lecture slides", "up:slides"), ("Past labs/tutorials", "up:reference")],
+                [("Logo", "up:logo"), ("Template (.docx)", "up:template")],
+            ),
+        )
     elif action == "tpl":
         await upload.cmd_template.__wrapped__(update, ctx, user)
 
@@ -116,12 +147,13 @@ async def post_init(app: Application):
     runner.tick_hooks.append(lambda: feedback.sweep_idle(app))
     app.bot_data["runner"] = runner
     app.bot_data["worker_task"] = asyncio.create_task(runner.run_forever())
-    if cfg.health_port:  # free hosts (Render/Koyeb) health-check an HTTP port even in polling mode
+    if cfg.health_port:
         async def _h(r, w):
             await r.read(1024)
             w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
             await w.drain()
             w.close()
+
         app.bot_data["health"] = await asyncio.start_server(_h, "0.0.0.0", cfg.health_port)
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMANDS])
 
@@ -136,16 +168,45 @@ async def post_shutdown(app: Application):
 
 
 def build_app(cfg: Config, request=None) -> Application:
-    b = Application.builder().token(cfg.bot_token).post_init(post_init).post_shutdown(post_shutdown)
-    if request is not None:  # tests inject a fake Bot API transport
-        b = b.request(request).get_updates_request(request)
+    if request is None:
+        request = HTTPXRequest(
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=30.0,
+        )
+    b = (
+        Application.builder()
+        .token(cfg.bot_token)
+        .request(request)
+        .get_updates_request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+    )
     app = b.build()
     engine = make_engine(cfg.database_url)
-    app.bot_data.update(config=cfg, db=make_session_factory(engine), limiter=RateLimiter(), llm=build_router(cfg))
-    cmds = {"start": h_auth.start, "revoke": h_auth.revoke, "newcourse": courses.cmd_newcourse, "courses": courses.cmd_courses,
-            "switch": courses.cmd_courses, "plan": plan.cmd_plan, "generate": generate.cmd_generate, "items": review.cmd_items,
-            "rules": feedback.cmd_rules, "history": review.cmd_history, "logo": upload.cmd_logo, "template": upload.cmd_template,
-            "cancel": generate.cmd_cancel, "help": cmd_help}
+    app.bot_data.update(
+        config=cfg,
+        db=make_session_factory(engine),
+        limiter=RateLimiter(),
+        llm=build_router(cfg),
+    )
+    cmds = {
+        "start": h_auth.start,
+        "revoke": h_auth.revoke,
+        "newcourse": courses.cmd_newcourse,
+        "courses": courses.cmd_courses,
+        "switch": courses.cmd_courses,
+        "plan": plan.cmd_plan,
+        "generate": generate.cmd_generate,
+        "items": review.cmd_items,
+        "rules": feedback.cmd_rules,
+        "history": review.cmd_history,
+        "logo": upload.cmd_logo,
+        "template": upload.cmd_template,
+        "cancel": generate.cmd_cancel,
+        "help": cmd_help,
+    }
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
     cb = lambda fn, pat: app.add_handler(CallbackQueryHandler(fn, pattern=pat))
@@ -179,9 +240,17 @@ def build_app(cfg: Config, request=None) -> Application:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs URLs containing the bot token
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = Config.from_env()
-    missing = [k for k, v in {"TELEGRAM_BOT_TOKEN": cfg.bot_token, "INVITE_TOKEN": cfg.invite_token, "DATABASE_URL": cfg.database_url}.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "TELEGRAM_BOT_TOKEN": cfg.bot_token,
+            "INVITE_TOKEN": cfg.invite_token,
+            "DATABASE_URL": cfg.database_url,
+        }.items()
+        if not v
+    ]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
     if not any(cfg.api_keys.get(n) for n in cfg.provider_order):
