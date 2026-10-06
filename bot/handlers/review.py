@@ -49,9 +49,9 @@ async def send_files(bot, chat_id: int, sf, item_id: int, version: int | None = 
                    f"[item #{item.id}]\nReply to this message to give feedback.")[:1000]
         approved = item.status == "approved"
     await bot.send_document(chat_id, document=io.BytesIO(kd), filename=meta.filename("answer_key", "docx"),
-                            caption=key_caption, disable_notification=True)
+                            caption=key_caption, disable_notification=True, read_timeout=60.0, write_timeout=60.0)
     await bot.send_document(chat_id, document=io.BytesIO(sd), filename=meta.filename("student", "docx"), caption=caption,
-                            reply_markup=item_buttons(item_id, approved) if buttons else None, disable_notification=silent)
+                            reply_markup=item_buttons(item_id, approved) if buttons else None, disable_notification=silent, read_timeout=60.0, write_timeout=60.0)
 
 
 def make_deliver(app):
