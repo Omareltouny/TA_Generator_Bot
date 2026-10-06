@@ -81,12 +81,14 @@ async def test_full_user_journey(world):
     await ta.tap("pc")
     assert "Plan confirmed" in "\n".join(req.texts(111))
 
-    # --- selective generation: all assignments -> 3 x 2 docx delivered, student first
+    # --- selective generation: all assignments -> 3 x 2 docx delivered, answer key first, then student
     await ta.tap("g:assignment")
     await run_pending(app)
     names = req.doc_names(111)
-    assert names == [f"MATH_1920_assignment{i}_{k}.docx" for i in (1, 2, 3) for k in ("student", "answer_key")]
-    assert {"ap:3", "fb:3"} <= set(req.last_buttons()) or any(b.startswith("ap:") for b in req.last_buttons())
+    assert names == [f"MATH_1920_assignment{i}_{k}.docx" for i in (1, 2, 3) for k in ("answer_key", "student")]
+    doc_btns = [req._buttons_of(p) for n, p in req.calls if n == "sendDocument"]
+    assert len([b for b in doc_btns if b]) == 3 and all(any(x.startswith("ap:") for x in b) and any(x.startswith("fb:") for x in b) for b in doc_btns if b)
+    assert {"il:all:all:0"} <= set(req.last_buttons())          # one final message with [Review items]
 
     # --- another TA sees and can act on the same course; revoked user is blocked again
     await ta2.say("/start"); await ta2.say("s3cret")
@@ -106,18 +108,20 @@ async def test_full_user_journey(world):
     await ta.tap(f"ap:{a1.id}")
     async with sf() as s:
         assert (await s.get(PlanItem, a1.id)).status == "approved"
-    await ta.say("Use Java for everything", reply_to_text=f"Assignment 1\n[item #{a1.id}]")
+    await ta.say("Use Java for everything", reply_to_caption=f"Assignment 1\nv1 | draft\n[item #{a1.id}]")
     await ta.tap("fd")
-    assert any("Stored as course rule: Use Java for everything" in t for t in req.texts(111))
+    assert any("[course] Use Java for everything" in t for t in req.texts(111))
     await run_pending(app)
     async with sf() as s:
         item = await s.get(PlanItem, a1.id)
         assert item.status == "draft" and item.current_version == 2
         assert len(await repo.list_versions(s, a1.id)) == 2
-        assert (await s.execute(select(FeedbackRule).where(FeedbackRule.active))).scalars().first().rule_text == "Use Java for everything"
+        assert (await s.execute(select(FeedbackRule).where(FeedbackRule.status == "active"))).scalars().first().rule_text == "Use Java for everything"
 
-    # --- /rules, /history, rollback
+    # --- /rules hub shows the group, /history, rollback
     await ta.say("/rules")
+    assert any("Course 1" in t for t in req.texts(111)[-2:])
+    await ta.tap("r:g:course:0")
     assert any("Use Java for everything" in t for t in req.texts(111)[-2:])
     await ta.say("/history assignment 1")
     assert any("History of assignment 1" in t for t in req.texts(111))
@@ -150,14 +154,14 @@ async def test_materials_logo_pick_retry_idle_rules(world):
     await register_and_make_course(app, req, ta)
 
     # reference material as a ZIP (+ junk that must be skipped) feeds retrieval into prompts
-    await ta.say("/courses"); await ta.tap("sel:1"); await ta.tap("up:reference")
+    await ta.say("/courses"); await ta.tap("sel:1"); await ta.tap("up:reference"); await ta.tap("up:ref:tutorial")
     z = io.BytesIO()
     with zipfile.ZipFile(z, "w") as zf:
         zf.writestr("old/lab1.txt", "Integration by substitution worked example: let u = g(x). " * 40)
         zf.writestr("photo.png", b"x"); zf.writestr("../evil.txt", b"x")
     await ta.send_file("past.zip", z.getvalue())
     msg = [t for t in req.texts(111) if t.startswith("Added")][-1]
-    assert "Added 1 file(s)" in msg and "Skipped 2" in msg
+    assert "Added 1 worksheet for tutorials" in msg and "Skipped 2" in msg
 
     # logo
     await ta.say("/logo")
@@ -201,21 +205,23 @@ async def test_materials_logo_pick_retry_idle_rules(world):
         (await s.get(UserState, 1)).updated_at = datetime.now(timezone.utc) - timedelta(minutes=5)
         await s.commit()
     await fbh.sweep_idle(app)
-    assert any("Pinned to this item: Q3 answer should be 42" in t for t in req.texts(111))
+    assert any("[this item] Q3 answer should be 42" in t for t in req.texts(111))
     await run_pending(app)
     async with sf() as s:
         assert (await s.get(PlanItem, t1.id)).current_version == 2
         rule = (await s.execute(select(FeedbackRule).where(FeedbackRule.item_id == t1.id))).scalar_one()
-    # flip to course scope, edit it, then delete it via /rules buttons
-    await ta.tap(f"rl:{rule.id}:flip")
+    # widen to course scope from the card, edit it, then disable it via /rules buttons
+    card = req.msg_id("Feedback on", 111)
+    await ta.tap(f"sc:{rule.id}:course", msg_id=card)
     async with sf() as s:
-        assert (await s.get(FeedbackRule, rule.id)).item_id is None
-    await ta.tap(f"rl:{rule.id}:edit"); await ta.say("Always show final answers in bold")
+        r = await s.get(FeedbackRule, rule.id)
+        assert r.scope == "course" and r.item_id is None and r.status == "active"
+    await ta.tap(f"r:e:{rule.id}:course:0"); await ta.say("Always show final answers in bold")
     async with sf() as s:
         assert (await s.get(FeedbackRule, rule.id)).rule_text == "Always show final answers in bold"
-    await ta.tap(f"rl:{rule.id}:del")
+    await ta.tap(f"r:d:{rule.id}:course:0")
     async with sf() as s:
-        assert not (await s.get(FeedbackRule, rule.id)).active
+        assert (await s.get(FeedbackRule, rule.id)).status == "disabled"
 
     # /cancel on a queued job leaves items untouched
     await ta.tap("g:assignment")

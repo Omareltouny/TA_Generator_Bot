@@ -24,6 +24,15 @@ class Config:
     api_keys: dict[str, str] = field(default_factory=dict)
     max_file_mb: int = 20
     max_total_material_mb: int = 60
+    # OCR for scanned PDFs (rewrite spec 9)
+    ocr_enabled: bool = True
+    ocr_langs: str = "eng"          # tesseract format, e.g. "eng+ara"
+    ocr_dpi: int = 200
+    ocr_max_pages: int = 60
+    # Worksheet style examples (spec 5.2) and Telegram status-message throttle (spec 10.1)
+    examples_per_type: int = 2
+    example_max_chars: int = 3500
+    status_edit_min_interval_s: float = 3.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -59,4 +68,11 @@ class Config:
             },
             max_file_mb=int(e.get("MAX_FILE_MB", "20")),
             max_total_material_mb=int(e.get("MAX_TOTAL_MATERIAL_MB", "60")),
+            ocr_enabled=e.get("OCR_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off", ""),
+            ocr_langs=e.get("OCR_LANGS", "eng").strip() or "eng",
+            ocr_dpi=int(e.get("OCR_DPI", "200")),
+            ocr_max_pages=int(e.get("OCR_MAX_PAGES", "60")),
+            examples_per_type=int(e.get("EXAMPLES_PER_TYPE", "2")),
+            example_max_chars=int(e.get("EXAMPLE_MAX_CHARS", "3500")),
+            status_edit_min_interval_s=float(e.get("STATUS_EDIT_MIN_INTERVAL_S", "3.0")),
         )

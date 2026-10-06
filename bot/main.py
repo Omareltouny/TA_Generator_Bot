@@ -9,7 +9,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 
 from bot.config import Config
 from bot.db.session import make_engine, make_session_factory
-from bot.handlers import auth as h_auth, courses, feedback, generate, plan, review, ui, upload
+from bot.handlers import auth as h_auth, courses, feedback, generate, plan, review, rules_hub, ui, upload, worksheets
 from bot.services import repo
 from bot.services.auth import RateLimiter, get_active_user
 from bot.services.jobs import JobRunner
@@ -44,13 +44,18 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "feedback":
         return await feedback.on_feedback_text(update, ctx, user, text)
     if mode == "rule_edit":
-        return await feedback.on_rule_edit_text(update, ctx, user, text)
+        return await rules_hub.on_rule_edit_text(update, ctx, user, text)
+    if mode == "rule_add":
+        return await rules_hub.on_rule_add_text(update, ctx, user, text)
+    if mode == "rule_conflict_edit":
+        return await feedback.on_conflict_edit_text(update, ctx, user, text)
     if mode == "pick":
         return await generate.on_pick_text(update, ctx, user, text)
     if mode == "awaiting_outline":
         return await update.message.reply_text("Please send the outline as a PDF file.")
     reply_to = update.message.reply_to_message
-    m = ui.ITEM_TAG.search(reply_to.text or "") if reply_to else None
+    # delivered items are documents: their tag lives in the caption, not in text
+    m = ui.ITEM_TAG.search(reply_to.text or reply_to.caption or "") if reply_to else None
     if m:  # replying to a delivered item = feedback on it
         return await feedback.start_feedback(update, ctx, user, int(m.group(1)), first_text=text)
     await update.message.reply_text("Use /help to see what I can do.")
@@ -73,7 +78,7 @@ async def _outline_correction(update, ctx, user, text):
         c = await s.get(Course, course.id)
         await repo.apply_outline(c, new.model_dump())
         await s.commit()
-    await ui.reply(update, op.summarize(new), ui.kb([("Continue to plan", "oc")], [("Add slides", "up:slides"), ("Add past labs/tutorials", "up:reference")], [("Add logo", "up:logo")]))
+    await ui.reply(update, op.summarize(new), ui.kb([("Continue to plan", "oc")], [("Add slides", "up:slides"), ("Add past worksheets", "up:reference")], [("Add logo", "up:logo")]))
 
 
 async def cmd_help(update, ctx):
@@ -91,10 +96,10 @@ async def cb_menu(update, ctx, user):
     elif action == "gen":
         await generate.show_menu(update, ctx, user)
     elif action == "rules":
-        await feedback.show_rules(update, ctx, user)
+        await rules_hub.show_hub(update, ctx, user)
     elif action == "up":
         await update.effective_message.reply_text("What do you want to add?", reply_markup=ui.kb(
-            [("Lecture slides", "up:slides"), ("Past labs/tutorials", "up:reference")], [("Logo", "up:logo"), ("Template (.docx)", "up:template")]))
+            [("Lecture slides", "up:slides"), ("Past worksheets", "up:reference")], [("Logo", "up:logo"), ("Template (.docx)", "up:template")]))
     elif action == "tpl":
         await upload.cmd_template.__wrapped__(update, ctx, user)
 
@@ -109,10 +114,10 @@ async def post_init(app: Application):
     async def notify(chat_id, text, **kw):
         await app.bot.send_message(chat_id, text, **kw)
 
-    async def progress(chat_id, message_id, text):
-        await app.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+    async def status(chat_id, message_id, text, markup=None, force=False):
+        await ui.live(app.bot_data, app.bot, chat_id, message_id).update(text, markup, force=force)
 
-    runner = JobRunner(sf, app.bot_data["llm"], deliver=review.make_deliver(app), notify=notify, progress=progress)
+    runner = JobRunner(sf, app.bot_data["llm"], deliver=review.make_deliver(app), notify=notify, status=status, cfg=cfg)
     runner.tick_hooks.append(lambda: feedback.sweep_idle(app))
     app.bot_data["runner"] = runner
     app.bot_data["worker_task"] = asyncio.create_task(runner.run_forever())
@@ -144,7 +149,7 @@ def build_app(cfg: Config, request=None) -> Application:
     app.bot_data.update(config=cfg, db=make_session_factory(engine), limiter=RateLimiter(), llm=build_router(cfg))
     cmds = {"start": h_auth.start, "revoke": h_auth.revoke, "newcourse": courses.cmd_newcourse, "courses": courses.cmd_courses,
             "switch": courses.cmd_courses, "plan": plan.cmd_plan, "generate": generate.cmd_generate, "items": review.cmd_items,
-            "rules": feedback.cmd_rules, "history": review.cmd_history, "logo": upload.cmd_logo, "template": upload.cmd_template,
+            "rules": rules_hub.cmd_rules, "history": review.cmd_history, "logo": upload.cmd_logo, "template": upload.cmd_template,
             "cancel": generate.cmd_cancel, "help": cmd_help}
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
@@ -153,6 +158,7 @@ def build_app(cfg: Config, request=None) -> Application:
     cb(courses.cmd_newcourse, r"^nc$")
     cb(cb_menu, r"^m:\w+$")
     cb(upload.cb_upload_kind, r"^up:\w+$")
+    cb(upload.cb_upload_ref, r"^up:ref:\w+$")
     cb(upload.cb_template, r"^tp:\d+$")
     cb(plan.cb_outline_continue, r"^oc$")
     cb(plan.cb_confirm, r"^pc$")
@@ -171,7 +177,31 @@ def build_app(cfg: Config, request=None) -> Application:
     cb(review.cb_history_rollback, r"^hr:\d+:\d+$")
     cb(feedback.cb_feedback_start, r"^fb:\d+$")
     cb(feedback.cb_feedback_done, r"^fd$")
-    cb(feedback.cb_rule, r"^rl:\d+:(del|flip|edit)$")
+    cb(feedback.cb_feedback_cancel, r"^fx$")
+    cb(feedback.cb_conflict, r"^cf:\d+:(old|new|both|edit|back)$")
+    cb(feedback.cb_scope, r"^s[ch]:\d+:\w+$")
+    cb(feedback.cb_undo, r"^un:\d+$")
+    cb(rules_hub.cb_hub, r"^r:hub$")
+    cb(rules_hub.cb_group, r"^r:g:\w+:\d+$")
+    cb(rules_hub.cb_rule_op, r"^r:(e|d|u|x|xx|s):\d+(:\w+:\d+)?$")
+    cb(rules_hub.cb_add, r"^r:add$")
+    cb(rules_hub.cb_add_scope, r"^r:as:\w+$")
+    cb(rules_hub.cb_add_done, r"^r:ad$")
+    cb(rules_hub.cb_add_cancel, r"^r:ax$")
+    cb(rules_hub.cb_pending, r"^r:pend$")
+    cb(worksheets.cb_examples, r"^r:ex$")
+    cb(worksheets.cb_example_toggle, r"^r:xt:\d+$")
+    cb(worksheets.cb_menu, r"^ws:menu$")
+    cb(worksheets.cb_build, r"^ws:build:\w+$")
+    cb(worksheets.cb_review, r"^ws:rev:[\w-]+$")
+    cb(worksheets.cb_approve, r"^ws:ok:[\w-]+$")
+    cb(worksheets.cb_approve_choice, r"^ws:(rp|kb):[\w-]+$")
+    cb(worksheets.cb_cancel, r"^ws:cx:[\w-]+$")
+    cb(worksheets.cb_pick_rules, r"^ws:(ed|dl):[\w-]+$")
+    cb(worksheets.cb_back, r"^ws:bk:[\w-]+$")
+    cb(worksheets.cb_heading, r"^ws:hw:[\w-]+:\w+$")
+    cb(worksheets.cb_rule_edit, r"^ws:e:\d+$")
+    cb(worksheets.cb_rule_delete, r"^ws:d:\d+$")
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, upload.on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app

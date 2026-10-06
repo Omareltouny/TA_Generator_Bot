@@ -1,5 +1,7 @@
 # Spec: TA Course-Material Bot (Telegram)
 
+> **Superseded in part:** sections 6.5 (feedback buttons), 6.6 (feedback handling, "latest wins" conflict resolution) and the related data model are replaced by `TA_BOT_REWRITE_SPEC.md`. Rules are no longer auto-deactivated, have course/type/item scope, and Telegram delivery is one live status message plus per-item documents.
+
 Target implementer: Claude Code. This document is the single source of truth. All decisions in section 3 are confirmed by the owner.
 
 ---

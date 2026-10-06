@@ -16,7 +16,7 @@ async def cmd_newcourse(update: Update, ctx: ContextTypes.DEFAULT_TYPE, user):
     async with ui.sf(ctx)() as s:
         await repo.set_state(s, user.id, mode="awaiting_outline", course_id=None, data={})
     await ui.answer(update)
-    await ui.reply(update, "Send the course outline as a PDF (required). Afterwards you can add slides, past labs/tutorials "
+    await ui.reply(update, "Send the course outline as a PDF (required). Afterwards you can add slides, past worksheets "
                            "(files or one zip) and a logo.")
 
 

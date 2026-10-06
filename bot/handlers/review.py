@@ -19,8 +19,8 @@ TYPES = ["all", "lab", "tutorial", "assignment"]
 STATUSES = ["all", "planned", "draft", "approved", "failed"]
 
 
-def item_buttons(item_id: int):
-    return ui.kb([("Approve", f"ap:{item_id}"), ("Give feedback", f"fb:{item_id}")],
+def item_buttons(item_id: int, approved: bool = False):
+    return ui.kb([("Approved" if approved else "Approve", f"ap:{item_id}"), ("Give feedback", f"fb:{item_id}")],
                  [("Regenerate", f"rg:{item_id}"), ("Export .tex", f"tx:{item_id}")], [("History", f"hi:{item_id}")])
 
 
@@ -28,7 +28,10 @@ def _meta(course: Course, item: PlanItem) -> renderer.DocMeta:
     return renderer.DocMeta(course.code or "", course.name or "", item.type, item.seq, item.week, item.title)
 
 
-async def send_files(bot, chat_id: int, sf, item_id: int, version: int | None = None, buttons=True, note: str = ""):
+async def send_files(bot, chat_id: int, sf, item_id: int, version: int | None = None, buttons=True, note: str = "",
+                     silent: bool = False):
+    """Deliver one item as two documents: answer key first (quiet), then the student sheet that carries the tag
+    line and the buttons (rewrite spec 10.3). `silent=True` also mutes the student document (batch jobs)."""
     async with sf() as s:
         item = await s.get(PlanItem, item_id)
         v = await repo.get_version(s, item_id, version) if item else None
@@ -38,17 +41,22 @@ async def send_files(bot, chat_id: int, sf, item_id: int, version: int | None = 
             return
         meta = _meta(course, item)
         sd, kd = v.student_docx, v.key_docx
-        text = (f"{item.type.title()} {item.seq} (week {item.week or '?'}) - {item.title}\n"
-                f"Version {v.version} - status: {item.status}{note}\n[item #{item.id}]")
-    await bot.send_document(chat_id, document=io.BytesIO(sd), filename=meta.filename("student", "docx"))
-    await bot.send_document(chat_id, document=io.BytesIO(kd), filename=meta.filename("answer_key", "docx"))
-    await bot.send_message(chat_id, text + "\nReply to this message with text to give feedback.",
-                           reply_markup=item_buttons(item_id) if buttons else None)
+        label = f"{item.type.title()} {item.seq}"
+        n_rules = len(v.feedback_rule_ids or [])
+        key_caption = f"Answer key | {label} v{v.version}{note} [item #{item.id}]"
+        caption = (f"{label} (week {item.week or '?'}): {item.title}\n"
+                   f"v{v.version} | {item.status} | {n_rules} rule{'s' if n_rules != 1 else ''} applied{note}\n"
+                   f"[item #{item.id}]\nReply to this message to give feedback.")[:1000]
+        approved = item.status == "approved"
+    await bot.send_document(chat_id, document=io.BytesIO(kd), filename=meta.filename("answer_key", "docx"),
+                            caption=key_caption, disable_notification=True)
+    await bot.send_document(chat_id, document=io.BytesIO(sd), filename=meta.filename("student", "docx"), caption=caption,
+                            reply_markup=item_buttons(item_id, approved) if buttons else None, disable_notification=silent)
 
 
 def make_deliver(app):
-    async def deliver(chat_id: int, item_id: int):
-        await send_files(app.bot, chat_id, app.bot_data["db"], item_id)
+    async def deliver(chat_id: int, item_id: int, single: bool = False):
+        await send_files(app.bot, chat_id, app.bot_data["db"], item_id, silent=not single)
     return deliver
 
 
@@ -59,16 +67,20 @@ async def _item(ctx, item_id: int) -> PlanItem | None:
 
 @require_user
 async def cb_approve(update, ctx, user):
-    await ui.answer(update)
     iid = int(update.callback_query.data.split(":")[1])
     async with ui.sf(ctx)() as s:
         item = await s.get(PlanItem, iid)
         if not item or item.current_version == 0:
-            await ui.reply(update, "Nothing to approve yet.")
+            await ui.answer(update, "Nothing to approve yet.")
             return
         item.status = "approved"
         await s.commit()
-    await ui.reply(update, f"Approved {item.type} {item.seq}. You can still give feedback on it later (it will go back to draft).")
+        label = f"{item.type.title()} {item.seq}"
+    await ui.answer(update, f"Approved {label}. Feedback later sends it back to draft.")
+    try:  # no new message: the tapped document's button row shows the state
+        await update.callback_query.edit_message_reply_markup(reply_markup=item_buttons(iid, approved=True))
+    except Exception:
+        pass
 
 
 @require_user

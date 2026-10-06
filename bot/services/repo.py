@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.db.models import (Course, FeedbackRule, ItemVersion, Job, Material, PlanItem, Template, UserState)
+from bot.db.models import (Course, FeedbackRule, ItemVersion, Job, Material, PlanItem, Template, TypeFormat, UserState)
 from bot.services.planner import Draft
 
 
@@ -44,8 +44,10 @@ async def apply_outline(course: Course, outline: dict) -> None:
     course.term, course.language_hint = outline.get("term"), outline.get("language_hint")
 
 
-async def add_material(s: AsyncSession, course_id: int, kind: str, filename: str, text: str | None, user_id: int) -> Material:
-    m = Material(course_id=course_id, kind=kind, filename=filename[:300], extracted_text=text, uploaded_by=user_id)
+async def add_material(s: AsyncSession, course_id: int, kind: str, filename: str, text: str | None, user_id: int, *,
+                       item_type: str | None = None, is_example: bool = False, ocr_pages: int | None = None) -> Material:
+    m = Material(course_id=course_id, kind=kind, filename=filename[:300], extracted_text=text, uploaded_by=user_id,
+                 item_type=item_type, is_example=is_example, ocr_pages=ocr_pages)
     s.add(m)
     await s.flush()
     return m
@@ -59,6 +61,28 @@ async def material_chars(s: AsyncSession, course_id: int) -> int:
 async def material_texts(s: AsyncSession, course_id: int, kinds=("slides", "reference")) -> list[tuple[str, str]]:
     rows = (await s.execute(select(Material).where(Material.course_id == course_id, Material.kind.in_(kinds)))).scalars()
     return [(m.filename, m.extracted_text or "") for m in rows if m.extracted_text]
+
+
+async def reference_materials(s: AsyncSession, course_id: int, item_type: str) -> list[Material]:
+    """Past worksheets of one type, oldest first."""
+    q = select(Material).where(Material.course_id == course_id, Material.kind == "reference",
+                               Material.item_type == item_type).order_by(Material.id)
+    return [m for m in (await s.execute(q)).scalars() if m.extracted_text]
+
+
+async def get_heading_word(s: AsyncSession, course_id: int, item_type: str) -> str:
+    """Required top-level heading word for a type (TypeFormat row, else Task for labs / Question otherwise)."""
+    from bot.services.generator import default_heading_word
+    tf = (await s.execute(select(TypeFormat).where(TypeFormat.course_id == course_id, TypeFormat.item_type == item_type))).scalar_one_or_none()
+    return tf.heading_word if tf else default_heading_word(item_type)
+
+
+async def set_heading_word(s: AsyncSession, course_id: int, item_type: str, word: str) -> None:
+    tf = (await s.execute(select(TypeFormat).where(TypeFormat.course_id == course_id, TypeFormat.item_type == item_type))).scalar_one_or_none()
+    if tf is None:
+        s.add(TypeFormat(course_id=course_id, item_type=item_type, heading_word=word))
+    else:
+        tf.heading_word = word
 
 
 # ---- plan ---------------------------------------------------------------
@@ -131,6 +155,13 @@ async def create_job(s: AsyncSession, course_id: int, kind: str, payload: dict, 
     return j
 
 
+async def queue_regen(s: AsyncSession, batch, *, status_msg_id: int | None = None) -> Job:
+    """Create the regeneration job for a resolved feedback batch (callers invoke this once, on resolution)."""
+    return await create_job(s, batch.course_id, "generate",
+                            {"item_ids": [batch.regen_item_id], "chat_id": batch.chat_id,
+                             "status_msg_id": status_msg_id, "origin": "feedback"}, batch.user_id)
+
+
 async def claim_next_job(s: AsyncSession) -> Job | None:
     """Atomically claim the oldest runnable queued job (safe even if two instances overlap on a deploy)."""
     now = datetime.now(timezone.utc).timestamp()
@@ -160,7 +191,7 @@ async def requeue_running_jobs(s: AsyncSession) -> int:
 
 async def active_rules_count(s: AsyncSession, course_id: int) -> int:
     return (await s.execute(select(func.count(FeedbackRule.id)).where(
-        FeedbackRule.course_id == course_id, FeedbackRule.active.is_(True)))).scalar_one()
+        FeedbackRule.course_id == course_id, FeedbackRule.status == "active"))).scalar_one()
 
 
 async def list_templates(s: AsyncSession) -> list[Template]:

@@ -10,7 +10,7 @@ from bot.db.models import Job, PlanItem
 from bot.handlers import ui
 from bot.handlers.auth import require_user
 from bot.handlers.courses import require_course
-from bot.services import repo
+from bot.services import jobs, repo, rules
 from bot.services.selection import parse_selection
 
 PAGE = 8
@@ -23,8 +23,10 @@ async def show_menu(update: Update, ctx, user):
     if not course.plan_confirmed:
         await ui.reply(update, "Confirm the plan first (/plan).")
         return
+    async with ui.sf(ctx)() as s:
+        summary = await rules.summary_line(s, course.id)
     await ui.reply(update, "What should I generate? (Everything / All X only generate items that are still planned or failed; "
-                           "'Pick items' can also regenerate existing ones.)",
+                           "'Pick items' can also regenerate existing ones.)\n" + summary,
                    ui.kb([("Everything", "g:all")], [("All labs", "g:lab"), ("All tutorials", "g:tutorial"), ("All assignments", "g:assignment")],
                          [("Pick items", "g:pick")]))
 
@@ -35,14 +37,35 @@ async def cmd_generate(update, ctx, user):
     await show_menu(update, ctx, user)
 
 
+async def initial_status_text(sf, item_ids: list[int]) -> str:
+    """Text of the job's live status message at queue time."""
+    async with sf() as s:
+        items = [i for i in [await s.get(PlanItem, x) for x in item_ids] if i]
+        line = await rules.in_use_summary(s, items[0].course_id, items) if items else ""
+    return jobs.render_status([jobs.StatusItem(jobs.item_label(i)) for i in items], kind=jobs.kind_label(items), rules_line=line)
+
+
+async def queue_generation(bot, sf, *, course_id: int, user_id: int, chat_id: int, item_ids: list[int], origin: str):
+    """Send the ONE live status message for a job and queue it (the runner edits that message from now on)."""
+    msg = await bot.send_message(chat_id, await initial_status_text(sf, item_ids))
+    async with sf() as s:
+        return await repo.create_job(s, course_id, "generate", {"item_ids": item_ids, "chat_id": chat_id,
+                                                                 "status_msg_id": msg.message_id, "origin": origin}, user_id)
+
+
 async def start_job(update, ctx, user, course, item_ids: list[int], origin: str = "generate"):
     if not item_ids:
         await ui.reply(update, "Nothing to generate (everything in that selection is already generated). Use Pick items to regenerate.")
         return
-    chat_id = update.effective_chat.id
-    msg = await ui.reply(update, f"Queued {len(item_ids)} item(s). Starting shortly...")
     async with ui.sf(ctx)() as s:
-        await repo.create_job(s, course.id, "generate", {"item_ids": item_ids, "chat_id": chat_id, "progress_msg_id": msg.message_id, "origin": origin}, user.id)
+        n_pending = await rules.count_pending(s, course.id)
+    if n_pending:
+        await ui.reply(update, f"{n_pending} rule(s) are waiting for your decision. Resolve them before generating.",
+                       ui.kb([(f"Resolve pending ({n_pending})", "r:pend")]))
+        return
+    await queue_generation(ctx.bot, ui.sf(ctx), course_id=course.id, user_id=user.id, chat_id=update.effective_chat.id,
+                           item_ids=item_ids, origin=origin)
+    async with ui.sf(ctx)() as s:
         await repo.set_state(s, user.id, mode=None)
 
 

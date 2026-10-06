@@ -6,9 +6,9 @@ import pytest
 from sqlalchemy import select
 
 from bot.db.models import FeedbackRule, ItemVersion, Job, PlanItem
-from bot.services import feedback_store as fb, jobs, repo
+from bot.services import jobs, repo, rules
 from bot.services.jobs import JobRunner
-from tests.helpers import Scripted, make_llm, seed
+from tests.helpers import Scripted, active_rule_texts, feedback_round, make_llm, seed
 
 
 async def run(session_factory_like, session, llm, item_ids, user, course):
@@ -40,12 +40,13 @@ async def env(tmp_path):
 
 async def gen(sf, llm, uid, cid, item_ids):
     async with sf() as s:
-        j = await repo.create_job(s, cid, "generate", {"item_ids": item_ids, "chat_id": 1}, uid)
+        j = await repo.create_job(s, cid, "generate", {"item_ids": item_ids, "chat_id": 1, "status_msg_id": 9}, uid)
         jid = j.id
     msgs = []
 
     async def notify(chat, text, **kw): msgs.append(text)
-    r = JobRunner(sf, llm, notify=notify)
+    async def status(chat, mid, text, markup=None, force=False): msgs.append(text)
+    r = JobRunner(sf, llm, notify=notify, status=status)
     async with sf() as s:
         claimed = await repo.claim_next_job(s)
     assert claimed.id == jid
@@ -74,7 +75,7 @@ async def test_failures_do_not_abort_batch_and_retry(env):
     async with sf() as s:
         st = {i: (await s.get(PlanItem, ids[("lab", i)])).status for i in (1, 2, 3)}
     assert st == {1: "draft", 2: "failed", 3: "draft"}
-    assert any("Failed" in m for m in msgs) and any("1 failed" in m for m in msgs)
+    assert any("Lab 2 failed" in m for m in msgs) and any("Done: 2 generated, 1 failed." in m for m in msgs)
 
 
 async def test_feedback_loop_acceptance(env):
@@ -83,10 +84,11 @@ async def test_feedback_loop_acceptance(env):
     lab1, lab2 = ids[("lab", 1)], ids[("lab", 2)]
     await gen(sf, llm, uid, cid, [lab1, lab2])
 
-    # 1. feedback on lab1 -> rules stored, new version
+    # 1. feedback on lab1 -> rule stored (course scope), new version
     async with sf() as s:
-        out = await fb.process_feedback(s, llm, course_id=cid, item_id=lab1, user_id=uid, raw_texts=["Use Java for everything"], item_desc="lab 1")
-        assert out.rules[0].item_id is None  # classified as course rule
+        out = await feedback_round(s, llm, course_id=cid, item_id=lab1, user_id=uid, texts=["Use Java for everything"], item_desc="lab 1")
+        assert out.rules[0].scope == "course" and out.rules[0].item_id is None
+        assert out.resolved_batch is not None  # no conflict -> the caller may queue the regeneration
     await gen(sf, llm, uid, cid, [lab1])
     async with sf() as s:
         assert (await s.get(PlanItem, lab1)).current_version == 2
@@ -96,21 +98,34 @@ async def test_feedback_loop_acceptance(env):
     await gen(sf, llm, uid, cid, [lab2])
     assert any("Use Java for everything" in c for c in llm.providers[0].calls)
 
-    # 3. contradicting feedback deactivates the older rule and reports replacement
+    # 3. contradicting feedback: the NEW rule is pending, the old stays active, no job until the user decides
     async with sf() as s:
-        out = await fb.process_feedback(s, llm, course_id=cid, item_id=lab2, user_id=uid, raw_texts=["Use Python instead"], item_desc="lab 2")
-        assert len(out.superseded) == 1
-        old, new = out.superseded[0]
-        assert old.rule_text == "Use Java for everything" and not old.active and old.superseded_by == new.id
-        course_rules, _ = await fb.active_rules(s, cid, lab2)
-        assert [r.rule_text for r in course_rules] == ["Use Python instead"]
+        n_jobs = len((await s.execute(select(Job))).scalars().all())
+        out = await feedback_round(s, llm, course_id=cid, item_id=lab2, user_id=uid, texts=["Use Python instead"], item_desc="lab 2")
+        assert out.resolved_batch is None and len(out.pending) == 1
+        new = out.pending[0]
+        assert new.status == "pending" and new.pending_reason == "conflict" and len(new.conflict_reason) >= 10
+        old = await s.get(FeedbackRule, new.conflicts_with)
+        assert old.rule_text == "Use Java for everything" and old.status == "active"
+        assert len((await s.execute(select(Job))).scalars().all()) == n_jobs  # nothing queued while undecided
+        # the user picks "Keep new": old disabled + replaced_by, new active, batch resolved -> exactly one job
+        batch = await rules.resolve_conflict(s, new.id, "new")
+        assert batch is not None
+        regen = await repo.queue_regen(s, batch)
+        await s.refresh(old); await s.refresh(new)
+        assert old.status == "disabled" and old.replaced_by == new.id and new.status == "active"
+        assert len((await s.execute(select(Job))).scalars().all()) == n_jobs + 1
+        regen.status = "done"; await s.commit()  # keep it out of the later gen() claims
+        assert await rules.resolve_conflict(s, new.id, "new") is None  # double tap is a no-op
+        crules, _, _ = await active_rule_texts(s, cid, await s.get(PlanItem, lab2))
+        assert crules == ["Use Python instead"]
 
     # 4. approve, then feedback -> new version, status back to draft, history keeps both
     async with sf() as s:
         (await s.get(PlanItem, lab1)).status = "approved"
         await s.commit()
     async with sf() as s:
-        await fb.process_feedback(s, llm, course_id=cid, item_id=lab1, user_id=uid, raw_texts=["make it harder"], item_desc="lab 1")
+        await feedback_round(s, llm, course_id=cid, item_id=lab1, user_id=uid, texts=["make it harder"], item_desc="lab 1")
     await gen(sf, llm, uid, cid, [lab1])
     async with sf() as s:
         item = await s.get(PlanItem, lab1)
@@ -119,8 +134,8 @@ async def test_feedback_loop_acceptance(env):
 
     # 5. item-pinned correction survives regeneration of that item and does not leak
     async with sf() as s:
-        out = await fb.process_feedback(s, llm, course_id=cid, item_id=lab1, user_id=uid, raw_texts=["Q3 answer should be 42"], item_desc="lab 1")
-        assert out.rules[0].item_id == lab1
+        out = await feedback_round(s, llm, course_id=cid, item_id=lab1, user_id=uid, texts=["Q3 answer should be 42"], item_desc="lab 1")
+        assert out.rules[0].scope == "item" and out.rules[0].item_id == lab1
     llm.providers[0].calls.clear()
     await gen(sf, llm, uid, cid, [lab1])
     assert any("Q3 answer should be 42" in c for c in llm.providers[0].calls)

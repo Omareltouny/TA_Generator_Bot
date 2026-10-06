@@ -61,9 +61,8 @@ async def cb_confirm(update, ctx, user):
     async with ui.sf(ctx)() as s:
         (await s.get(Course, course.id)).plan_confirmed = True
         await repo.set_state(s, user.id, mode=None)
-    from bot.handlers.generate import show_menu
-    await ui.reply(update, "Plan confirmed. You can still edit it later with /plan.")
-    await show_menu(update, ctx, user)
+    from bot.handlers.rules_hub import send_gate
+    await send_gate(update, ctx, user, course)
 
 
 @require_user

@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
 
-from bot.services.pdf_text import extract_pdf
+from bot.services.pdf_text import OcrError, OcrOptions, extract_pdf, ocr_warning
 
 CODE_EXT = {".py", ".java", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".kt", ".js", ".ts", ".go", ".rs", ".sh",
             ".sql", ".m", ".r", ".swift", ".rb", ".php", ".asm", ".s", ".v", ".vhd", ".tex", ".csv", ".json", ".xml"}
@@ -27,6 +27,7 @@ def ext_of(name: str) -> str:
 class Extracted:
     text: str = ""
     warning: str | None = None
+    ocr_pages: list[int] = field(default_factory=list)  # pages read with OCR (stored on Material.ocr_pages)
 
 
 def _docx_text(data: bytes) -> str:
@@ -51,18 +52,28 @@ def _pptx_text(data: bytes) -> str:
     return "\n".join(out)
 
 
-def extract_text(name: str, data: bytes) -> Extracted:
+def extract_text(name: str, data: bytes, ocr: OcrOptions | None = None, progress=None) -> Extracted:
+    """Text of an uploaded file. Scanned PDF pages are OCR'd when `ocr` is given (None = OCR disabled).
+
+    Blocking (OCR): call through `asyncio.to_thread` from handlers. Raises ValueError with a user-facing reason.
+    """
     ext = ext_of(name)
     if ext not in ACCEPTED:
         raise ValueError(f"unsupported type {ext or '(none)'}")
-    warn = None
+    warn, ocr_pages = None, []
     if ext == ".pdf":
-        e = extract_pdf(data)
-        text = e.text
-        if e.empty_pages and len(e.empty_pages) == e.pages:
-            raise ValueError("PDF has no text layer (scanned images); OCR is not supported")
-        if e.empty_pages:
-            warn = f"{len(e.empty_pages)} page(s) had no text layer and were skipped"
+        try:
+            e = extract_pdf(data, ocr=ocr, progress=progress)
+        except OcrError as err:
+            raise ValueError(str(err))
+        text, ocr_pages = e.text, e.ocr_pages
+        if e.empty_pages and len(e.empty_pages) == e.pages and ocr is None:
+            raise ValueError("PDF has no text layer (scanned images) and OCR is disabled on this server (OCR_ENABLED=0)")
+        notes = [ocr_warning(e.ocr_pages, e.ocr_skipped, ocr.max_pages if ocr else None)]
+        plain_empty = [p for p in e.empty_pages if p not in e.ocr_skipped]
+        if plain_empty:
+            notes.append(f"{len(plain_empty)} page(s) had no text and were skipped")
+        warn = " ".join(n for n in notes if n) or None
     elif ext == ".docx":
         text = _docx_text(data)
     elif ext == ".pptx":
@@ -71,7 +82,7 @@ def extract_text(name: str, data: bytes) -> Extracted:
         text = data.decode("utf-8", errors="replace")
     if len(text) > MAX_TEXT_PER_FILE:
         text, warn = text[:MAX_TEXT_PER_FILE], f"truncated to {MAX_TEXT_PER_FILE:,} characters"
-    return Extracted(text, warn)
+    return Extracted(text, warn, ocr_pages)
 
 
 @dataclass
